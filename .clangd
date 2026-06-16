@@ -1,0 +1,18 @@
+# Editor (clangd) config. The project is built with the 32-bit MinGW cross
+# compiler (see build.sh: i686-w64-mingw32-g++), NOT the host clang. Pointing
+# clangd at that compiler makes it use the MinGW Windows SDK headers + target,
+# so <windows.h>, HMODULE, HRESULT, IMGUI_IMPL_API, etc. all resolve and the
+# spurious "file not found / unknown type" diagnostics go away.
+CompileFlags:
+  Compiler: /opt/homebrew/bin/i686-w64-mingw32-g++
+  Add:
+    - "--target=i686-w64-mingw32"
+    - "-std=c++17"
+    - "-fpermissive"
+    - "-DUNICODE"
+    - "-I/Users/nxsnorth/dmc4se-overlay/third_party/imgui"
+    - "-I/Users/nxsnorth/dmc4se-overlay/third_party/imgui/backends"
+    - "-I/Users/nxsnorth/dmc4se-overlay/third_party/kiero"
+    - "-I/Users/nxsnorth/dmc4se-overlay/third_party/minhook/include"
+    - "-I/Users/nxsnorth/dmc4se-overlay/third_party"
+    - "-I/Users/nxsnorth/dmc4se-overlay/src"
