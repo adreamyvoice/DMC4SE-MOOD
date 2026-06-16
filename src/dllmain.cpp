@@ -6240,11 +6240,21 @@ static HRESULT __stdcall hkResizeBuffers(IDXGISwapChain* sc, UINT bc, UINT w, UI
     return hr;
 }
 // ERR09 fix: DMC4SE throws a fatal "ERR09: Unsupported function" when it tries to
-// enter EXCLUSIVE fullscreen (the bug bites at non-1280x720 resolutions). We force
-// the swapchain to stay windowed/borderless so the game never runs that broken
-// path -- looks identical for most players, and resolution changes stop crashing.
+// enter EXCLUSIVE fullscreen (the bug bites at non-1280x720 resolutions). Rather
+// than overriding the player's choice, we honor whatever mode the game is set to:
+// a fullscreen request becomes a borderless full-monitor window (looks identical to
+// real fullscreen), and a windowed request restores the window. Either way the
+// swapchain never actually goes EXCLUSIVE, so the broken ERR09 path never runs and
+// resolution changes stop crashing -- the game just keeps the display mode you left
+// it in (fullscreen stays fullscreen, windowed stays windowed).
 static HRESULT __stdcall hkSetFullscreenState(IDXGISwapChain* sc, BOOL fs, IDXGIOutput* out) {
-    if (fs) logf("[err09] blocked exclusive fullscreen -> staying windowed");
+    if (fs) {
+        logf("[err09] fullscreen requested -> borderless full-monitor (exclusive avoided)");
+        setBorderless(true);
+    } else {
+        logf("[err09] windowed requested -> restoring window");
+        setBorderless(false);
+    }
     return oSetFullscreenState(sc, FALSE, nullptr);
 }
 // Bind our DXGI swapchain hooks once kiero has the methods table. Present/SetFullscreen/
