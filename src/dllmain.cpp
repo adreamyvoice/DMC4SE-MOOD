@@ -6247,18 +6247,29 @@ static HRESULT __stdcall hkSetFullscreenState(IDXGISwapChain* sc, BOOL fs, IDXGI
     if (fs) logf("[err09] blocked exclusive fullscreen -> staying windowed");
     return oSetFullscreenState(sc, FALSE, nullptr);
 }
+// Bind our DXGI swapchain hooks once kiero has the methods table. Present/SetFullscreen/
+// ResizeBuffers are IDXGISwapChain slots 8/10/13 -- identical whether the table was grabbed
+// via a D3D10 or D3D11 dummy device (both swapchains use dxgi.dll's shared vtable), and the
+// game's real D3D10 device is fetched from the swapchain inside hkPresent, so the render path
+// is unaffected by which dummy we used.
+static bool bindSwapchainHooks(const char* via) {
+    logf("[InitThread] kiero %s SUCCESS", via);
+    kiero::bind(8,  (void**)&oPresent,            (void*)hkPresent);
+    kiero::bind(10, (void**)&oSetFullscreenState, (void*)hkSetFullscreenState);
+    kiero::bind(13, (void**)&oResizeBuffers,      (void*)hkResizeBuffers);
+    return true;
+}
 static DWORD WINAPI InitThread(LPVOID) {
+    // Try D3D10 first (the game is DX10); fall back to a D3D11 dummy each round.
+    // Some Windows 11 setups fail to create the D3D10 dummy device, which left the
+    // overlay un-hooked (invisible). D3D11 hooks the same dxgi.dll Present, so it
+    // shows the menu on those machines too.
     for (int t = 0; t < 120; ++t) {
-        if (kiero::init(kiero::RenderType::D3D10) == kiero::Status::Success) {
-            logf("[InitThread] kiero D3D10 SUCCESS (try %d)", t);
-            kiero::bind(8,  (void**)&oPresent,            (void*)hkPresent);
-            kiero::bind(10, (void**)&oSetFullscreenState, (void*)hkSetFullscreenState);
-            kiero::bind(13, (void**)&oResizeBuffers,      (void*)hkResizeBuffers);
-            return 0;
-        }
+        if (kiero::init(kiero::RenderType::D3D10) == kiero::Status::Success) return bindSwapchainHooks("D3D10"), 0;
+        if (kiero::init(kiero::RenderType::D3D11) == kiero::Status::Success) return bindSwapchainHooks("D3D11 (Win11 fallback)"), 0;
         Sleep(500);
     }
-    logf("[InitThread] kiero D3D10 FAILED");
+    logf("[InitThread] kiero FAILED (D3D10 and D3D11 dummies both unavailable)");
     return 0;
 }
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
