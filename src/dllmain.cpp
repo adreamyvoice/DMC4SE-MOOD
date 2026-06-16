@@ -1490,31 +1490,12 @@ static int  g_recKey  = 0x71;                   // VK_F2 (rebindable)
 static int  g_playKey = 0x72;                   // VK_F3 (rebindable)
 static bool g_recKeyCapture = false, g_playKeyCapture = false;
 
-// Auto Royal Guard (Dante): hold the guard input while an enemy is in soft-target range, so
-// Dante auto-blocks whatever comes at him. No hit/hitbox detection needed -- Royal Guard blocks
-// anything that connects while you're guarding. The guard button bits are captured once via
-// "Learn" (you press your block button). Proximity = the actor's soft-target ptr (+0x4C4) is
-// set whenever an enemy is within ~120u, so we only guard when actually threatened.
-static bool g_autoRG = false;
-static volatile uint32_t g_rgBit = 0;     // captured guard-button bits
-static volatile bool g_rgLearn  = false;  // armed: capture the next non-zero input as the guard
-
 // Called from the cave on the game's input thread, once per input frame.
 extern "C" __attribute__((cdecl)) void macroInputTick(void* objv) {
     char* obj = (char*)objv;
     uint32_t live = *(uint32_t*)(obj + 0x192c);
     g_macroLive = live;
     g_macroHits++;                               // proves the hook is firing (shown in menu)
-    // --- Auto Royal Guard ---
-    if (g_rgLearn && live != 0) { g_rgBit = live; g_rgLearn = false; }  // capture the pressed button
-    if (g_autoRG && g_rgBit) {
-        char* actor = *(char**)(obj + 0x1940);   // the original instruction stored the actor here
-        if (actor && (uintptr_t)actor > 0x10000) {
-            int cid = *(int*)(actor + OFF_CHARID);          // 0 = Dante
-            void* soft = *(void**)(actor + 0x4C4);          // soft/auto target -> enemy within ~120u
-            if (cid == 0 && soft) *(uint32_t*)(obj + 0x192c) |= g_rgBit;   // force the guard input
-        }
-    }
     int st = g_recState;
     if (st == 1) {                               // recording
         int n = g_recLen;
@@ -5380,23 +5361,6 @@ static void DrawUI() {
             rightCol();
             ImGui::Checkbox("Vergil: Perfect JDC", &g_vergilJDC);
             hint("Yamato Perfect Execute: forces every Yamato charge release to count as a \"perfect\" execute -> instant perfect Just Distortion.");
-            ImGui::Unindent(8.0f);
-        }
-        if (ImGui::CollapsingHeader("Royal Guard (Dante)", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Indent(8.0f);
-            if (ImGui::Checkbox("Auto Royal Guard", &g_autoRG)) { if (g_autoRG) applyMacroHook(); }
-            hint("When an enemy comes within range, Dante automatically holds Royal Guard so he "
-                 "blocks whatever connects (Royal Guard blocks anything while held -- no hit-timing "
-                 "needed). Play as Dante with the Royal Guard style. Set your block button first.");
-            if (g_rgBit == 0 || g_rgLearn)
-                ImGui::TextColored(ImVec4(0.95f,0.55f,0.2f,1.0f), "guard button: NOT SET");
-            else
-                ImGui::Text("guard button: 0x%08X", (unsigned)g_rgBit);
-            ImGui::SameLine();
-            if (ImGui::Button(g_rgLearn ? "press your BLOCK button..." : "Learn guard button")) {
-                applyMacroHook(); g_rgLearn = true;
-            }
-            ImGui::TextDisabled("Click Learn, then in-game press ONLY your Royal Guard / block button once.");
             ImGui::Unindent(8.0f);
         }
         if (ImGui::CollapsingHeader("Combo Display", ImGuiTreeNodeFlags_DefaultOpen)) {
