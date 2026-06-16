@@ -11,7 +11,7 @@ mkdir -p "$OUT"
 
 INC="-I$TP/imgui -I$TP/imgui/backends -I$TP/kiero -I$TP/minhook/include -I$TP -Isrc"
 CFLAGS="-m32 -O2 -DNDEBUG"
-CXXFLAGS="$CFLAGS -std=c++17 -fpermissive $INC"
+CXXFLAGS="$CFLAGS -std=c++17 -fpermissive $INC ${MOOD_DEV:+-DMOOD_DEV}"   # MOOD_DEV=1 ./build.sh -> dev tools (logger, parry capture)
 
 echo "== compiling MinHook (C) =="
 MH_OBJ=""
