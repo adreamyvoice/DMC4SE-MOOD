@@ -21,6 +21,7 @@
 #include <cmath>
 #include <vector>
 #include <string>
+#include <functional>
 #include <algorithm>
 #include "imgui.h"
 #include "backends/imgui_impl_dx10.h"
@@ -1469,6 +1470,10 @@ static void danteServiceTick() {
 // active, so the hook is a no-op until used. Applied once at startup.
 static volatile uint32_t g_macroInject = 0;
 static volatile uint32_t g_macroHits = 0;   // cave-fire counter (diagnostic)
+// Hold to Shoot: shoot is bit 0x2 in the +0x192c button word (verified live). When held we pulse
+// the bit off every other frame so the game sees rapid press-edges -> autofire instead of a single
+// shot / Nero charge. Driven from macroInputTick on the input thread.
+static bool g_holdToShoot = false;
 // ---- Input record / playback (macro replay) --------------------------------
 // We hook the input-state store and, on the INPUT thread, call macroInputTick()
 // once per input frame right after the processor wrote the live state. It
@@ -1496,6 +1501,11 @@ extern "C" __attribute__((cdecl)) void macroInputTick(void* objv) {
     uint32_t live = *(uint32_t*)(obj + 0x192c);
     g_macroLive = live;
     g_macroHits++;                               // proves the hook is firing (shown in menu)
+    // Hold to Shoot: pulse the shoot bit (0x2) -> a held shoot button reads as rapid taps.
+    if (g_holdToShoot && (live & 0x2)) {
+        static uint32_t afCtr = 0;
+        if (afCtr++ & 1) { *(uint32_t*)(obj + 0x192c) = live & ~0x2u; }  // drop shoot every other frame
+    }
     int st = g_recState;
     if (st == 1) {                               // recording
         int n = g_recLen;
@@ -2600,6 +2610,331 @@ static void stopSwordTrick() {
     if (g_swCave) { VirtualFree(g_swCave, 0, MEM_RELEASE); g_swCave = nullptr; }
     g_swOn = false;
     logf("[swordtrick] removed");
+}
+
+// ===== MistressDMC: Increased Snatch Range (Nero) — high confidence cave =====
+// Hooks the snatch-length lookup `movss xmm0,[ecx+eax*4+0x214]` (SE RVA 0x5154FE)
+// and forces the result to a constant 2550.0f (3x Lv3 reach). No actor-struct
+// offsets touched. Reversible; rels computed at runtime.
+static void*   g_snatchCave  = nullptr;
+static uint8_t g_snatchSaved[9];
+static bool    g_snatchOn    = false;
+static const uint32_t kSnatchRva = 0x5154FE;
+static void stopSnatchRange() {
+    if (!g_snatchOn) return;
+    writeBytes(g_base + kSnatchRva, g_snatchSaved, 9);
+    if (g_snatchCave) { VirtualFree(g_snatchCave, 0, MEM_RELEASE); g_snatchCave = nullptr; }
+    g_snatchOn = false; logf("[snatch] off");
+}
+static bool applySnatchRange() {
+    if (g_snatchOn || !g_base) return true;
+    uintptr_t site = g_base + kSnatchRva;
+    if (!inModule(site, 9)) return false;
+    static const uint8_t orig9[9] = {0xF3,0x0F,0x10,0x84,0x81,0x14,0x02,0x00,0x00};
+    const uint8_t* a = (const uint8_t*)site;
+    if (!(memcmp(a, orig9, 9) == 0 || (a[0]==orig9[0] && a[8]==orig9[8]))) {
+        logf("[snatch] site 0x%X mismatch (%02X..%02X) -- skip", kSnatchRva, a[0], a[8]); return false; }
+    uint8_t cave[32]; int n = 0;
+    cave[n++]=0x68; cave[n++]=0x00; cave[n++]=0x60; cave[n++]=0x1F; cave[n++]=0x45; // push 0x451F6000 (2550.0f)
+    cave[n++]=0xF3; cave[n++]=0x0F; cave[n++]=0x10; cave[n++]=0x04; cave[n++]=0x24; // movss xmm0,[esp]
+    cave[n++]=0x83; cave[n++]=0xC4; cave[n++]=0x04;                                 // add esp,4
+    void* mem = VirtualAlloc(nullptr, 64, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) return false;
+    int32_t backRel = (int32_t)((site + 9) - ((uintptr_t)mem + n + 5));
+    cave[n++]=0xE9; memcpy(cave+n,&backRel,4); n+=4;
+    memcpy(mem, cave, n); FlushInstructionCache(GetCurrentProcess(), mem, n);
+    memcpy(g_snatchSaved, (void*)site, 9);
+    uint8_t hook[9]; hook[0]=0xE9;
+    int32_t toRel = (int32_t)((uintptr_t)mem - (site + 5));
+    memcpy(hook+1,&toRel,4);
+    for (int k=5;k<9;k++) hook[k]=0x90;
+    writeBytes(site, hook, 9);
+    g_snatchCave = mem; g_snatchOn = true; logf("[snatch] on -> cave %p", mem);
+    return true;
+}
+
+// ===== MistressDMC: Rose Removes Pins (Lucifer) — high confidence cave =====
+// Hooks 0x54B5D4 (steals `mov ebx,4`); when g_rosePins and pin state==3, sets
+// state(=[esi+0x04]) to 0 and returns via epilogue 0x54B696 so the pin despawns
+// instead of detonating. Installed once; checkbox flips the runtime flag.
+static volatile uint8_t g_rosePins   = 0;
+static const uint32_t   kRoseHook     = 0x54B5D4;
+static const uint8_t    kRoseOrig[5]  = { 0xBB,0x04,0x00,0x00,0x00 };
+static const uint32_t   kRoseResume   = 0x54B5D9;
+static const uint32_t   kRoseEpilogue = 0x54B696;
+static void* g_roseCave = nullptr;
+static bool  g_roseHookOn = false;
+static bool installRoseRemovesPins() {
+    if (g_roseHookOn) return true;
+    if (!g_base) return false;
+    uintptr_t site = g_base + kRoseHook;
+    if (!inModule(site, 5) || memcmp((void*)site, kRoseOrig, 5) != 0) {
+        logf("[rosepins] hook site unexpected (0x%02X) - aborting", *(uint8_t*)site);
+        return false;
+    }
+    uint8_t cave[] = {
+        0x80,0x3D, 0,0,0,0, 0x00,        // [0]  cmp byte[&g_rosePins],0
+        0x0F,0x84, 0,0,0,0,              // [7]  je  restore
+        0x80,0x7E,0x04,0x03,             // [13] cmp byte[esi+0x04],3
+        0x0F,0x85, 0,0,0,0,              // [17] jne restore
+        0xC6,0x46,0x04,0x00,             // [23] mov byte[esi+0x04],0
+        0xE9, 0,0,0,0,                   // [27] jmp epilogue
+        0xBB,0x04,0x00,0x00,0x00,        // [32] restore: mov ebx,4
+        0xE9, 0,0,0,0                    // [37] jmp resume
+    };
+    void* mem = VirtualAlloc(nullptr, sizeof(cave), MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) { logf("[rosepins] VirtualAlloc failed"); return false; }
+    uint32_t flagAddr = (uint32_t)(uintptr_t)&g_rosePins;  memcpy(cave + 2,  &flagAddr, 4);
+    int32_t  jeRel  = (int32_t)((uintptr_t)mem + 32) - ((uintptr_t)mem + 13); memcpy(cave + 9,  &jeRel, 4);
+    int32_t  jneRel = (int32_t)((uintptr_t)mem + 32) - ((uintptr_t)mem + 23); memcpy(cave + 19, &jneRel,4);
+    int32_t  epiRel = (int32_t)(g_base + kRoseEpilogue) - ((uintptr_t)mem + 32); memcpy(cave + 28, &epiRel,4);
+    int32_t  resRel = (int32_t)(g_base + kRoseResume)   - ((uintptr_t)mem + 42); memcpy(cave + 38, &resRel,4);
+    memcpy(mem, cave, sizeof(cave));
+    FlushInstructionCache(GetCurrentProcess(), mem, sizeof(cave));
+    uint8_t hook[5] = { 0xE9, 0,0,0,0 };
+    int32_t to = (int32_t)((uintptr_t)mem - (site + 5));  memcpy(hook + 1, &to, 4);
+    if (!writeBytes(site, hook, 5)) { VirtualFree(mem, 0, MEM_RELEASE); return false; }
+    g_roseCave = mem; g_roseHookOn = true;
+    logf("[rosepins] installed (cave=%p)", mem);
+    return true;
+}
+
+// ===== MistressDMC: No Helmbreaker Knockdown (Dante Helm Breaker / Nero Helm Splitter) =====
+// Mid-function cave at the reaction/knockback copy loop (SE RVA 0x6A648 = cmp ecx,5 ; jl 0x6A5E1).
+// When the active char is mid-helm-move, suppress = exit the copy loop immediately (no knockback
+// components written -> only stun). Gated by MOOD-verified active player + mAtckId.
+static bool g_noHelmBreaker = false;   // Dante
+static bool g_noHelmSplit   = false;   // Nero
+extern "C" __attribute__((cdecl)) int helmSuppress() {
+    char* a = (char*)activePlayer();
+    if (!a || !memReadable(a, 0x1B00)) return 0;
+    int cid = *(volatile int32_t*)(a + OFF_CHARID);    // +0x19AC (0=Dante,1=Nero)
+    uint32_t atck = *(volatile uint32_t*)(a + 0x1A74); // mAtckId
+    if (g_noHelmBreaker && cid == 0 && atck == 7) return 1;            // Helm Breaker
+    if (g_noHelmSplit   && cid == 1 && (atck == 27 || atck == 40)) return 1; // Split / Double Down
+    return 0;
+}
+static const uint32_t kHelmHook    = 0x6A648;
+static const uint8_t  kHelmOrig[5] = {0x83,0xF9,0x05,0x7C,0x94};
+static void* g_helmCave   = nullptr;
+static bool  g_helmHookOn = false;
+static void applyHelmHook() {
+    if (g_helmHookOn || !g_base) return;
+    uintptr_t site = g_base + kHelmHook;
+    if (!inModule(site, 5) || (memcmp((void*)site, kHelmOrig, 5) != 0 &&
+                               memcmp((void*)site, kHelmOrig, 4) != 0)) { // rel8 byte may drift
+        logf("[helm] hook site unexpected -- aborting"); return;
+    }
+    uintptr_t jeTgt = g_base + 0x6A5E1;   // write-component branch
+    uintptr_t cont  = g_base + 0x6A64D;   // loop tail / exit
+    uint8_t cave[] = {
+        0x60,                       // [0]  pushad
+        0x9C,                       // [1]  pushf
+        0xB8,0,0,0,0,               // [2]  mov eax, helmSuppress  (operand @3)
+        0xFF,0xD0,                  // [7]  call eax
+        0x84,0xC0,                  // [9]  test al,al
+        0x9D,                       // [11] popf
+        0x61,                       // [12] popad
+        0x75,0x0E,                  // [13] jnz do_suppress (->@29)
+        0x83,0xF9,0x05,             // [15] cmp ecx,5
+        0x0F,0x8C,0,0,0,0,          // [18] jl jeTgt   (operand @20, end @24)
+        0xE9,0,0,0,0,               // [24] jmp cont   (operand @25, end @29)
+        0xE9,0,0,0,0                // [29] do_suppress: jmp cont (operand @30, end @34)
+    };
+    uint32_t fn = (uint32_t)(uintptr_t)&helmSuppress; memcpy(cave + 3, &fn, 4);
+    void* mem = VirtualAlloc(nullptr, sizeof(cave), MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) return;
+    *(int32_t*)(cave + 20) = (int32_t)(jeTgt - ((uintptr_t)mem + 24)); // jl jeTgt
+    *(int32_t*)(cave + 25) = (int32_t)(cont  - ((uintptr_t)mem + 29)); // jmp cont (normal ecx>=5)
+    *(int32_t*)(cave + 30) = (int32_t)(cont  - ((uintptr_t)mem + 34)); // jmp cont (suppress)
+    memcpy(mem, cave, sizeof(cave));
+    FlushInstructionCache(GetCurrentProcess(), mem, sizeof(cave));
+    uint8_t hook[5] = { 0xE9,0,0,0,0 };
+    int32_t to = (int32_t)((uintptr_t)mem - (site + 5));
+    memcpy(hook + 1, &to, 4);
+    if (!writeBytes(site, hook, 5)) { VirtualFree(mem, 0, MEM_RELEASE); return; }
+    g_helmCave = mem; g_helmHookOn = true; logf("[helm] knockback hook applied %p", mem);
+}
+static void stopHelmHook() {
+    if (!g_helmHookOn) return;
+    writeBytes(g_base + kHelmHook, kHelmOrig, 5);
+    if (g_helmCave) { VirtualFree(g_helmCave, 0, MEM_RELEASE); g_helmCave = nullptr; }
+    g_helmHookOn = false; logf("[helm] removed");
+}
+
+// ===== MistressDMC: Skip Shotgun/Gilgamesh/Pandora/Lucifer (Dante weapon-cycle) =====
+static volatile uint8_t g_skipShotgun  = 0;
+static volatile uint8_t g_skipPandora  = 0;
+static volatile uint8_t g_skipGilgamesh= 0;
+static volatile uint8_t g_skipLucifer  = 0;
+static const uint32_t kSkipGunRVA   = 0xDE01F;
+static const uint32_t kSkipSwordRVA = 0xDE05F;
+static const uint8_t  kSkipGunOrig[5]   = {0x89,0x47,0x30,0xB0,0x01};
+static const uint8_t  kSkipSwordOrig[5] = {0x89,0x47,0x2C,0xB0,0x01};
+static void*   g_skipGunCave   = nullptr;  static uint8_t g_skipGunSaved[5];   static bool g_skipGunOn   = false;
+static void*   g_skipSwordCave = nullptr;  static uint8_t g_skipSwordSaved[5]; static bool g_skipSwordOn = false;
+static bool skipInstall(uint32_t rva, const uint8_t* orig, uint8_t memOff,
+                        uint8_t a, uint8_t tgtA, volatile uint8_t* skA,
+                        uint8_t b, uint8_t tgtB, volatile uint8_t* skB,
+                        void** caveOut, uint8_t* saved, bool* onFlag) {
+    if (*onFlag || !g_base) return true;
+    uintptr_t site = g_base + rva;
+    if (!inModule(site, 5) || memcmp((void*)site, orig, 5) != 0) {
+        logf("[skipwpn] site 0x%X mismatch -- skip", rva); return false; }
+    uint8_t c[96]; int n = 0;
+    uint32_t addrA = (uint32_t)(uintptr_t)skA, addrB = (uint32_t)(uintptr_t)skB;
+    c[n++]=0x89; c[n++]=0x47; c[n++]=memOff;
+    c[n++]=0x83; c[n++]=0xF8; c[n++]=a;
+    c[n++]=0x75; int jA = n++;
+    c[n++]=0x80; c[n++]=0x3D; memcpy(c+n,&addrA,4); n+=4; c[n++]=0x01;
+    c[n++]=0x75; int jAdone = n++;
+    c[n++]=0xC7; c[n++]=0x47; c[n++]=memOff; c[n++]=tgtA; c[n++]=0; c[n++]=0; c[n++]=0;
+    int chkB = n;
+    c[(size_t)jA]    = (uint8_t)(chkB - (jA+1));
+    c[(size_t)jAdone]= (uint8_t)(chkB - (jAdone+1));
+    c[n++]=0x83; c[n++]=0xF8; c[n++]=b;
+    c[n++]=0x75; int jB = n++;
+    c[n++]=0x80; c[n++]=0x3D; memcpy(c+n,&addrB,4); n+=4; c[n++]=0x01;
+    c[n++]=0x75; int jBdone = n++;
+    c[n++]=0xC7; c[n++]=0x47; c[n++]=memOff; c[n++]=tgtB; c[n++]=0; c[n++]=0; c[n++]=0;
+    int done = n;
+    c[(size_t)jB]    = (uint8_t)(done - (jB+1));
+    c[(size_t)jBdone]= (uint8_t)(done - (jBdone+1));
+    c[n++]=0xB0; c[n++]=0x01;
+    void* mem = VirtualAlloc(nullptr, 128, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) return false;
+    int32_t back = (int32_t)((site + 5) - ((uintptr_t)mem + n + 5));
+    c[n++]=0xE9; memcpy(c+n,&back,4); n+=4;
+    memcpy(mem, c, n); FlushInstructionCache(GetCurrentProcess(), mem, n);
+    memcpy(saved, (void*)site, 5);
+    uint8_t hook[5] = {0xE9,0,0,0,0};
+    int32_t to = (int32_t)((uintptr_t)mem - (site + 5));
+    memcpy(hook+1,&to,4);
+    writeBytes(site, hook, 5);
+    *caveOut = mem; *onFlag = true;
+    logf("[skipwpn] site 0x%X hooked -> cave %p (%d bytes)", rva, mem, n);
+    return true;
+}
+static void skipRemove(uint32_t rva, const uint8_t* saved, void** caveOut, bool* onFlag) {
+    if (!*onFlag) return;
+    writeBytes(g_base + rva, saved, 5);
+    if (*caveOut) { VirtualFree(*caveOut, 0, MEM_RELEASE); *caveOut = nullptr; }
+    *onFlag = false;
+}
+static void skipSyncGun() {
+    if (g_skipShotgun || g_skipPandora)
+        skipInstall(kSkipGunRVA, kSkipGunOrig, 0x30, 7, 8, &g_skipShotgun, 8, 9, &g_skipPandora,
+                    &g_skipGunCave, g_skipGunSaved, &g_skipGunOn);
+    else skipRemove(kSkipGunRVA, g_skipGunSaved, &g_skipGunCave, &g_skipGunOn);
+}
+static void skipSyncSword() {
+    if (g_skipGilgamesh || g_skipLucifer)
+        skipInstall(kSkipSwordRVA, kSkipSwordOrig, 0x2C, 5, 6, &g_skipGilgamesh, 6, 4, &g_skipLucifer,
+                    &g_skipSwordCave, g_skipSwordSaved, &g_skipSwordOn);
+    else skipRemove(kSkipSwordRVA, g_skipSwordSaved, &g_skipSwordCave, &g_skipSwordOn);
+}
+
+// ===== MistressDMC: Easy Enemy Step — 50% bigger enemy-step hitspheres =====
+static const uint32_t kESHook = 0xA44CE0;
+static const uint8_t  kESOrig[5] = { 0xF3,0x0F,0x10,0x5E,0xF0 };   // movss xmm3,[esi-0x10]
+static float   g_easyStepScale = 1.5f;
+static bool    g_easyStepFlag  = false;
+static bool    g_easyStepWant  = false;
+static void*   g_esCave  = nullptr;
+static uint8_t g_esSaved[5];
+static bool    g_esOn    = false;
+static bool applyEasyStep() {
+    if (g_esOn) return true;
+    if (!g_base) return false;
+    uintptr_t site = g_base + kESHook;
+    if (!inModule(site,5) || memcmp((void*)site, kESOrig, 5) != 0) {
+        logf("[estep] site unexpected - aborting"); return false;
+    }
+    uint8_t cave[] = {
+        0xF3,0x0F,0x10,0x5E,0xF0,                 // movss xmm3,[esi-0x10]
+        0x80,0x3D, 0,0,0,0, 0x00,                 // cmp byte[g_easyStepFlag],0
+        0x74,0x08,                                // je skip
+        0xF3,0x0F,0x59,0x1D, 0,0,0,0,             // mulss xmm3,[g_easyStepScale]
+        0xE9, 0,0,0,0                             // jmp back
+    };
+    uint32_t flagAbs  = (uint32_t)(uintptr_t)&g_easyStepFlag;
+    uint32_t scaleAbs = (uint32_t)(uintptr_t)&g_easyStepScale;
+    void* mem = VirtualAlloc(nullptr, sizeof(cave), MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) { logf("[estep] VirtualAlloc failed"); return false; }
+    memcpy(cave + 7,  &flagAbs,  4);
+    memcpy(cave + 18, &scaleAbs, 4);
+    int32_t backRel = (int32_t)((site + 5) - ((uintptr_t)mem + 22 + 5));
+    memcpy(cave + 23, &backRel, 4);
+    memcpy(mem, cave, sizeof(cave));
+    FlushInstructionCache(GetCurrentProcess(), mem, sizeof(cave));
+    uint8_t hook[5] = { 0xE9, 0,0,0,0 };
+    int32_t toRel = (int32_t)((uintptr_t)mem - (site + 5));
+    memcpy(hook + 1, &toRel, 4);
+    memcpy(g_esSaved, (void*)site, 5);
+    if (!writeBytes(site, hook, 5)) { VirtualFree(mem, 0, MEM_RELEASE); return false; }
+    g_esCave = mem; g_esOn = true; logf("[estep] applied (cave=%p)", mem);
+    return true;
+}
+static void stopEasyStep() {
+    if (!g_esOn) return;
+    writeBytes(g_base + kESHook, g_esSaved, 5);
+    if (g_esCave) { VirtualFree(g_esCave, 0, MEM_RELEASE); g_esCave = nullptr; }
+    g_esOn = false; logf("[estep] removed");
+}
+
+// ===== MistressDMC: Force Lucifer — rose never force-despawns on weapon change =====
+static const uint32_t kFLHook   = 0x56D0EC;
+static const uint8_t  kFLOrig[6]= {0x88,0x86,0x8C,0x18,0x00,0x00}; // mov [esi+0x188C],al
+static volatile uint8_t g_forceLucifer = 0;
+static void* g_flCave = nullptr;
+static uint8_t g_flSaved[6];
+static bool  g_flOn = false;
+static bool applyForceLucifer() {
+    if (g_flOn) return true;
+    if (!g_base) return false;
+    uintptr_t site = g_base + kFLHook;
+    if (!inModule(site, 6) || memcmp((void*)site, kFLOrig, 6) != 0) {
+        logf("[forcelucifer] hook site unexpected (0x%02X) - aborting", *(uint8_t*)site);
+        return false;
+    }
+    uintptr_t flagAddr = (uintptr_t)&g_forceLucifer;
+    uint8_t cave[] = {
+        0x80,0x3D,0,0,0,0, 0x01,         // [0]  cmp byte[g_forceLucifer],1
+        0x75,0x0D,                       // [7]  jne do_store
+        0x83,0xFF,0x06,                  // [9]  cmp edi,6
+        0x75,0x09,                       // [12] jne do_store (-> @23, end@14: 23-14=9)
+        0x84,0xC0,                       // [14] test al,al
+        0x75,0x04,                       // [16] jnz do_store
+        0xE9,0,0,0,0,                    // [18] jmp skip_store
+        0x88,0x86,0x8C,0x18,0x00,0x00,   // [23] do_store: mov [esi+0x188C],al
+        0xE9,0,0,0,0                     // [29] jmp resume
+    };
+    cave[8]  = 0x0E;                      // jne -> do_store (23-9)
+    cave[17] = 0x05;                      // jnz -> do_store (23-18)
+    const size_t SKIP_JMP = 18, DO_JMP = 29;
+    void* mem = VirtualAlloc(nullptr, sizeof(cave), MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) { logf("[forcelucifer] VirtualAlloc failed"); return false; }
+    memcpy(cave + 2, &flagAddr, 4);
+    uintptr_t resume = site + 6;
+    int32_t backSkip = (int32_t)(resume - ((uintptr_t)mem + SKIP_JMP + 5));
+    int32_t backDo   = (int32_t)(resume - ((uintptr_t)mem + DO_JMP   + 5));
+    memcpy(cave + SKIP_JMP + 1, &backSkip, 4);
+    memcpy(cave + DO_JMP   + 1, &backDo,   4);
+    memcpy(mem, cave, sizeof(cave));
+    FlushInstructionCache(GetCurrentProcess(), mem, sizeof(cave));
+    uint8_t hook[6] = { 0xE9,0,0,0,0, 0x90 };
+    int32_t to = (int32_t)((uintptr_t)mem - (site + 5));
+    memcpy(hook + 1, &to, 4);
+    memcpy(g_flSaved, (void*)site, 6);
+    if (!writeBytes(site, hook, 6)) { VirtualFree(mem, 0, MEM_RELEASE); return false; }
+    g_flCave = mem; g_flOn = true; logf("[forcelucifer] cave installed (%p)", mem);
+    return true;
+}
+static void stopForceLucifer() {
+    if (!g_flOn) return;
+    writeBytes(g_base + kFLHook, g_flSaved, 6);
+    if (g_flCave) { VirtualFree(g_flCave, 0, MEM_RELEASE); g_flCave = nullptr; }
+    g_flOn = false; g_forceLucifer = 0; logf("[forcelucifer] removed");
 }
 
 // ---- Restore Lucifer Bug: reverts SE's Lucifer needles to vanilla DMC4 behaviour --
@@ -4090,6 +4425,7 @@ static bool g_vergilJDC = false;       // Vergil - pin Yamato "Perfect Execute" 
 // (g_infConc removed -- Vergil concentration hack dropped by request)
 static bool g_infBeowulf = false;      // Vergil - pin Beowulf charge ONLY while Beowulf equipped (checkbox toggle)
 static bool g_infGilgamesh = false;    // Dante - pin Gilgamesh charge to max (checkbox toggle)
+static bool g_disableDTStinger = false; // Dante - DT Stinger behaves like normal Stinger Lv2 (MistressDMC port)
 static bool g_infLightningKick = false;// Trish - pin Lighting Kick charge to max (checkbox toggle)
 static uint32_t g_btnMask = 0;         // live read of the button bitmask (Majin+0x192C) for macro mapping
 // ---- Macro / autofire: 4 slots, each spams a chosen button bit ----
@@ -4157,10 +4493,225 @@ static void diagTick() {
 // x86->ARM translator blocks (so CE's "find what accesses" never fires). Per-frame data
 // writes to force it either race the game thread (enemy+0xD0C distance) or freeze it
 // (actor+0x4C4 list node). Left for a real-Windows session where CE breakpoints work.
+// ===== MistressDMC: Random Mutator Mode (timed weighted-random gameplay mutators) =====
+static void hint(const char* tip);   // fwd (defined with the GUI helpers below)
+static bool setRoomSpeed(float v) {
+    uintptr_t base; if (!readPtr(g_base + 0xF59F18, base) || !base) return false;
+    return writeMem(base + 0x34, &v, 4);
+}
+struct MoodMutator {
+    std::string name, desc; bool enabled = true; int weight = 6; float duration = 20.0f;
+    std::function<void()> onStart = []{}; std::function<void()> onEnd = []{}; std::function<void()> onFrame = []{};
+    bool active = false; float timeLeft = 0.0f;
+};
+static std::vector<MoodMutator> g_muts;
+static bool  g_mutRunning = false;
+static int   g_mutModTime = 20, g_mutCoolTime = 12;
+static float g_mutCool = 0.0f;
+static int   g_mutActiveIdx = -1;
+static bool mutInGameplay() { uintptr_t sp; return readPtr(g_base + 0xF59F18, sp) && sp; }
+static float g_shPrev[3] = {0,0,0}; static bool g_shHave = false; static float g_shSmooth = 0.05f;
+static void superhotFrame() {
+    uintptr_t mj;
+    if (!majinRoot(mj) || !readPtr(mj, mj) || !mj) { g_shHave = false; return; }
+    if (!memReadable((void*)(mj + 0x48), 4)) { g_shHave = false; return; }
+    float x = *(float*)(mj + 0x40), y = *(float*)(mj + 0x44), z = *(float*)(mj + 0x48);
+    if (!g_shHave) { g_shPrev[0]=x; g_shPrev[1]=y; g_shPrev[2]=z; g_shHave=true; }
+    float dx=x-g_shPrev[0], dy=y-g_shPrev[1], dz=z-g_shPrev[2];
+    g_shPrev[0]=x; g_shPrev[1]=y; g_shPrev[2]=z;
+    float speed = sqrtf(dx*dx+dy*dy+dz*dz);
+    float t = speed * 1.4f; if (t > 1.0f) t = 1.0f;
+    float target = t*t*(3.0f-2.0f*t);
+    static float prev = 0.0f;
+    float val = (target * g_shSmooth) + (1.0f - g_shSmooth) * prev;
+    prev = val; if (val < 0.02f) val = 0.02f;
+    setWorkRate(3, val); setRoomSpeed(val);
+}
+static bool g_dvdOn = false; static float g_dvdPos[2] = {300,300}; static float g_dvdVel[2] = {120,120}; static int g_dvdHue = 0;
+static void dvdFrame() {
+    if (!g_dvdOn) return;
+    ImGuiIO& io = ImGui::GetIO();
+    float dt = io.DeltaTime; if (dt <= 0.0f || dt > 0.1f) dt = 1.0f/60.0f;
+    const ImVec2 sz(190.0f, 90.0f);
+    g_dvdPos[0] += g_dvdVel[0]*dt; g_dvdPos[1] += g_dvdVel[1]*dt;
+    bool hit=false;
+    if (g_dvdPos[0] <= 0) { g_dvdPos[0]=0; g_dvdVel[0]= fabsf(g_dvdVel[0]); hit=true; }
+    if (g_dvdPos[0]+sz.x >= io.DisplaySize.x){ g_dvdPos[0]=io.DisplaySize.x-sz.x; g_dvdVel[0]=-fabsf(g_dvdVel[0]); hit=true; }
+    if (g_dvdPos[1] <= 0) { g_dvdPos[1]=0; g_dvdVel[1]= fabsf(g_dvdVel[1]); hit=true; }
+    if (g_dvdPos[1]+sz.y >= io.DisplaySize.y){ g_dvdPos[1]=io.DisplaySize.y-sz.y; g_dvdVel[1]=-fabsf(g_dvdVel[1]); hit=true; }
+    if (hit) g_dvdHue = (g_dvdHue + 47) % 360;
+    ImColor col = ImColor::HSV(g_dvdHue/360.0f, 1.0f, 1.0f, 1.0f);
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(ImVec2(g_dvdPos[0],g_dvdPos[1]), ImVec2(g_dvdPos[0]+sz.x,g_dvdPos[1]+sz.y), IM_COL32(0,0,0,200), 6.0f);
+    dl->AddRect(ImVec2(g_dvdPos[0],g_dvdPos[1]), ImVec2(g_dvdPos[0]+sz.x,g_dvdPos[1]+sz.y), (ImU32)col, 6.0f, 0, 2.0f);
+    dl->AddText(ImVec2(g_dvdPos[0]+14, g_dvdPos[1]+34), (ImU32)col, "MistressDMC");
+}
+static void slowmoStart() { setWorkRate(0, 0.35f); }
+static void slowmoEnd()   { setWorkRate(0, 1.0f);  }
+static void mutatorsInit() {
+    if (!g_muts.empty()) return;
+    MoodMutator sh; sh.name="SUPERHOT"; sh.desc="Time only moves when you move"; sh.weight=6; sh.duration=20.0f;
+    sh.onStart=[]{ g_shHave=false; }; sh.onFrame=[]{ superhotFrame(); }; sh.onEnd=[]{ setWorkRate(3,1.0f); setRoomSpeed(1.0f); };
+    g_muts.push_back(sh);
+    MoodMutator sm; sm.name="Slow-Mo Burst"; sm.desc="Bullet-time for the duration"; sm.weight=6; sm.duration=12.0f;
+    sm.onStart=[]{ slowmoStart(); }; sm.onEnd=[]{ slowmoEnd(); };
+    g_muts.push_back(sm);
+}
+static int mutatorPick() {
+    int total = 0;
+    for (auto& m : g_muts) if (m.enabled && m.weight > 0) total += m.weight;
+    if (total <= 0) return -1;
+    int r = rand() % total, acc = 0;
+    for (int i = 0; i < (int)g_muts.size(); ++i) {
+        if (!g_muts[i].enabled || g_muts[i].weight <= 0) continue;
+        acc += g_muts[i].weight; if (r < acc) return i;
+    }
+    return -1;
+}
+static void mutatorStop() {
+    if (g_mutActiveIdx >= 0) { g_muts[g_mutActiveIdx].onEnd(); g_muts[g_mutActiveIdx].active=false; }
+    g_mutActiveIdx = -1; g_mutCool = 0.0f;
+    setWorkRate(0,1.0f); setWorkRate(3,1.0f); setRoomSpeed(1.0f); g_dvdOn=false;
+}
+static void mutatorTick() {
+    mutatorsInit();
+    if (!g_mutRunning) return;
+    float dt = ImGui::GetIO().DeltaTime; if (dt <= 0.0f || dt > 0.1f) dt = 1.0f/60.0f;
+    if (!mutInGameplay()) return;
+    if (g_mutActiveIdx >= 0) {
+        MoodMutator& m = g_muts[g_mutActiveIdx];
+        m.onFrame(); m.timeLeft -= dt;
+        if (m.timeLeft <= 0.0f) { m.onEnd(); m.active=false; g_mutActiveIdx=-1; g_mutCool=(float)g_mutCoolTime; }
+    } else {
+        g_mutCool -= dt;
+        if (g_mutCool <= 0.0f) {
+            int idx = mutatorPick();
+            if (idx >= 0) { g_mutActiveIdx = idx; g_muts[idx].active = true; g_muts[idx].timeLeft = (float)g_mutModTime;
+                            g_muts[idx].onStart(); logf("[mutator] activating %s", g_muts[idx].name.c_str()); }
+            else g_mutCool = 1.0f;
+        }
+    }
+}
+static void mutatorDrawTab() {
+    mutatorsInit();
+    ImGui::TextWrapped("Random timed gameplay mutators. Set the timers, enable the pool, then Start. [experimental]");
+    ImGui::Spacing();
+    ImGui::SetNextItemWidth(150);
+    if (ImGui::InputInt("Mod timer (seconds)", &g_mutModTime, 1, 5)) { if (g_mutModTime < 3) g_mutModTime = 3; }
+    ImGui::SameLine(); hint("How long each random mutator stays active.");
+    ImGui::SetNextItemWidth(150);
+    if (ImGui::InputInt("Cooldown timer (seconds)", &g_mutCoolTime, 1, 5)) { if (g_mutCoolTime < 0) g_mutCoolTime = 0; }
+    ImGui::SameLine(); hint("Gap between mutators.");
+    ImGui::Spacing();
+    if (!g_mutRunning) { if (ImGui::Button("Start Random Mutator Mode")) { g_mutRunning = true; g_mutCool = 0.0f; } }
+    else {
+        if (ImGui::Button("Stop Random Mutator Mode")) { g_mutRunning = false; mutatorStop(); }
+        ImGui::SameLine();
+        if (g_mutActiveIdx >= 0) ImGui::Text("Active: %s  (%.1fs)", g_muts[g_mutActiveIdx].name.c_str(), g_muts[g_mutActiveIdx].timeLeft);
+        else                     ImGui::Text("Next mutator in %.1fs", g_mutCool);
+    }
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader("Mutator Pool", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::BeginTable("mutpool", 3, ImGuiTableFlags_BordersInnerH)) {
+            ImGui::TableSetupColumn("Name"); ImGui::TableSetupColumn("Enabled"); ImGui::TableSetupColumn("Weight");
+            ImGui::TableHeadersRow();
+            for (int i = 0; i < (int)g_muts.size(); ++i) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::Text("%s", g_muts[i].name.c_str());
+                if (ImGui::IsItemHovered() && !g_muts[i].desc.empty()) ImGui::SetTooltip("%s", g_muts[i].desc.c_str());
+                ImGui::TableSetColumnIndex(1); ImGui::PushID(i); ImGui::Checkbox("##en", &g_muts[i].enabled);
+                ImGui::TableSetColumnIndex(2); ImGui::SetNextItemWidth(120);
+                ImGui::DragInt("##w", &g_muts[i].weight, 1, 0, 100, "%d", ImGuiSliderFlags_AlwaysClamp);
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+    if (ImGui::CollapsingHeader("SUPERHOT tuning")) {
+        ImGui::SetNextItemWidth(150);
+        ImGui::SliderFloat("Velocity smoothing", &g_shSmooth, 0.01f, 0.5f, "%.2f");
+        hint("Lower = snappier reaction to your movement.");
+    }
+}
+
+// ===== MistressDMC: Custom Camera Variables (additive on top of MOOD camera) =====
+static bool  g_camVarsOn   = false;
+static float g_cvHeight=0, g_cvDistance=0, g_cvDistLock=0, g_cvAngle=0, g_cvAngleLock=0, g_cvFov=0, g_cvFovBattle=0;
+static void applyCamVars() {
+    if (!g_camVarsOn) return;
+    uint8_t* cd = getCameraData();
+    if (!cd) return;
+    if (g_cvHeight   != 0.0f) *(float*)(cd + 0xD0) += g_cvHeight;
+    if (g_cvDistance != 0.0f) *(float*)(cd + 0xD8) += g_cvDistance;
+    if (g_cvDistLock != 0.0f) *(float*)(cd + 0xDC) += g_cvDistLock;
+    if (g_cvAngle    != 0.0f) *(float*)(cd + 0xD4) += g_cvAngle;
+    if (g_cvFov       != 0.0f) *(float*)(cd + 0xE4) += g_cvFov;
+    if (g_cvFovBattle != 0.0f) *(float*)(cd + 0xE8) += g_cvFovBattle;
+}
+
+// ===== MistressDMC: Selective Cancels (Dante) — make chosen moves cancellable =====
+enum SelCancelBit {
+    SC_ECSTASY=0x1, SC_ARGUMENT=0x2, SC_KICK13=0x4, SC_SLASH_DIM=0x8, SC_PROP=0x10,
+    SC_SHOCK=0x20, SC_OMEN=0x40, SC_GUNSTINGER=0x80, SC_EPIDEMIC=0x100, SC_DT_PIN_UP=0x200,
+    SC_DRAW=0x800, SC_ROLL=0x2000, SC_STINGER=0x4000, SC_REAL_IMPACT=0x8000, SC_FLUSH=0x10000,
+};
+static bool     g_scEnableDante = false;
+static uint32_t g_scCancels     = 0;
+static const int kSC_Melee = 0x3874, kSC_Style = 0x38F8, kSC_Jump = 0x3924;
+static inline void scWrite(char* a, int slot, int v) { *(volatile int*)(a + slot) = v; }
+static void applySelectiveCancels() {
+    if (!g_scEnableDante || g_scCancels == 0) return;
+    char* a = (char*)activePlayer();
+    if (!a || !memReadable(a, 0x3A00)) return;
+    if (*(uint8_t*)(a + 0x19AC) != 0) return;          // Dante only
+    uint32_t mv = *(volatile uint32_t*)(a + 0x1A00);   // mActionNo
+    #define SC_USUAL(bit) do { if (g_scCancels & (bit)) scWrite(a, kSC_Jump, 2); } while(0)
+    switch (mv) {
+        case 0x007: case 0x008: SC_USUAL(SC_ROLL); break;
+        case 0x411: case 0x412: SC_USUAL(SC_ECSTASY); break;
+        case 0x732: SC_USUAL(SC_ARGUMENT); break;
+        case 0x900: SC_USUAL(SC_SLASH_DIM); break;
+        case 0x232: SC_USUAL(SC_PROP); break;
+        case 0x735: SC_USUAL(SC_OMEN); break;
+        case 0x635: SC_USUAL(SC_GUNSTINGER); break;
+        case 0x706: SC_USUAL(SC_EPIDEMIC); break;
+        case 0x410: SC_USUAL(SC_DT_PIN_UP); break;
+        case 0x310: SC_USUAL(SC_DRAW); break;
+        case 0x20F: SC_USUAL(SC_STINGER); break;
+        case 0x335: SC_USUAL(SC_REAL_IMPACT); break;
+        case 0x30E: case 0x30F: SC_USUAL(SC_KICK13); break;
+        case 0x333: SC_USUAL(SC_SHOCK); break;
+        case 0x31E: case 0x31F: case 0x320:
+            if (g_scCancels & SC_FLUSH) { scWrite(a, kSC_Melee, 2); scWrite(a, kSC_Style, 2); scWrite(a, kSC_Jump, 2); }
+            break;
+        default: break;
+    }
+    #undef SC_USUAL
+}
+
+// ===== MistressDMC: Easy Quick Drive — Prop cancellable into Quick Drive (~frame 7) =====
+static bool  g_easyQuickDrive = false;
+static float g_eqdFrameMax    = 7.0f;
+static void applyEasyQuickDrive() {
+    if (!g_easyQuickDrive) return;
+    char* a = (char*)activePlayer();
+    if (!a || !memReadable(a, 0x3A00)) return;
+    if (*(uint8_t*)(a + 0x19AC) != 0) return;                 // Dante only
+    uint32_t action = *(uint32_t*)(a + 0x1A00);
+    uint32_t atck   = *(uint32_t*)(a + 0x1A74);
+    uint32_t aen    = *(uint32_t*)(a + 0x1A78);
+    if (action != 0xC || atck != 16 || aen == 0) return;      // not Prop
+    if (*(float*)(a + 0x52C) >= g_eqdFrameMax) return;        // past early-frame window
+    static const int slot[8] = {0x3874,0x38A0,0x38CC,0x38F8,0x3924,0x3950,0x397C,0x39A8};
+    for (int s : slot) *(volatile int*)(a + s) = 2;
+}
+
 static void updateMajinPins() {
     int z = 0; (void)z;
     applyFpsLimit();        // pin the FPS cap (game restores it)
     applySuperCancel();     // pin cancel-table slots while Super Cancel is on
+    applyEasyQuickDrive();  // MistressDMC: open Prop->Quick Drive window
+    applySelectiveCancels(); // MistressDMC: pin selected move cancel slots
     // Infinite Concentration: pin Vergil's concentration float (activePlayer()+0x7B58) to Lv2
     // (200.0) so Judgement Cut End is always usable WITHOUT the super-speed a maxed value gives.
     if (g_infConc) {
@@ -4209,6 +4760,10 @@ static void updateMajinPins() {
         if (g_hrWant && live && (cid == 2 || cid == 3 || cid == 4)) { if (!g_hrOn) applyHeightBypass(); }
         else if (g_hrOn) stopHeightBypass();
     }
+    g_easyStepFlag = g_easyStepWant;                       // MistressDMC: Easy Enemy Step
+    if (g_easyStepWant) { if (!g_esOn) applyEasyStep(); } else if (g_esOn) stopEasyStep();
+    if (g_noHelmBreaker || g_noHelmSplit) { if (!g_helmHookOn) applyHelmHook(); }  // No Helmbreaker Knockdown
+    else if (g_helmHookOn) stopHelmHook();
     if (g_infTrickTp)    { static const uint32_t o[] = {0x174C4};          pinCounterZero(o, 1); }
     if (g_infAirCalibur) { static const uint32_t o[] = {0xCC1C,0xA4,0x4C4}; pinCounterZero(o, 3); }
     // (Infinite Concentration removed by request.)
@@ -4266,6 +4821,18 @@ static void updateMajinPins() {
                 uint8_t cur = 0xFF;
                 if (memReadable((void*)a, 1)) cur = *(volatile uint8_t*)a;
                 if (cur <= 1) { uint8_t one = 1; writeMem(a, &one, 1); }  // only a sane flag byte
+            }
+        }
+    }
+    if (g_disableDTStinger) {   // Dante in DT: rewrite DT-Stinger atck id (0xA) -> Stinger Lv2 (0x9)
+        char* pl = (char*)activePlayer();
+        if (pl && memReadable(pl, 0x2800)) {
+            int      ch  = (int)*(uint8_t*)(pl + 0x19AC);   // char id (0 = Dante)
+            uint32_t aen = *(uint32_t*)(pl + 0x1A78);       // mAtckId_Enable
+            uint8_t  dt8 = *(uint8_t*)(pl + 0x2773);        // in DT
+            if (ch == 0 && dt8 && aen != 0) {
+                uint32_t atck = *(uint32_t*)(pl + 0x1A74);  // mAtckId
+                if (atck == 0xA) { uint32_t v = 0x9; writeMem((uintptr_t)(pl + 0x1A74), &v, 4); }
             }
         }
     }
@@ -4342,15 +4909,27 @@ static bool saveConfig(const char* profile) {
     fprintf(f, "camOn=%d\n",    g_camOn ? 1 : 0);
     fprintf(f, "camDist=%.3f\n",   g_camDist);
     fprintf(f, "camHeight=%.3f\n", g_camHeight);
+    fprintf(f, "camVarsOn=%d\n", g_camVarsOn ? 1 : 0);
+    fprintf(f, "cvHeight=%.3f\n", g_cvHeight); fprintf(f, "cvDistance=%.3f\n", g_cvDistance);
+    fprintf(f, "cvDistLock=%.3f\n", g_cvDistLock); fprintf(f, "cvAngle=%.3f\n", g_cvAngle);
+    fprintf(f, "cvFov=%.3f\n", g_cvFov); fprintf(f, "cvFovBattle=%.3f\n", g_cvFovBattle);
     fprintf(f, "speedOn=%d\n",  g_speedOn ? 1 : 0);
     for (int k = 0; k < kNSpeed; ++k) fprintf(f, "speed%d=%.4f\n", k, g_speedVal[k]);
     fprintf(f, "luc=%d\n",      g_lucOn ? 1 : 0);
+    fprintf(f, "snatch=%d\n",   g_snatchOn ? 1 : 0);
+    fprintf(f, "rosePins=%d\n", g_rosePins ? 1 : 0);
     fprintf(f, "fh=%d\n",       g_fhOn ? 1 : 0);
     fprintf(f, "jc=%d\n",       g_jcOn ? 1 : 0);
     fprintf(f, "dtSpam=%d\n", g_dtSpam ? 1 : 0);
     fprintf(f, "vergilJDC=%d\n", g_vergilJDC ? 1 : 0);
     fprintf(f, "infBeowulf=%d\n", g_infBeowulf ? 1 : 0);
     fprintf(f, "infGilgamesh=%d\n", g_infGilgamesh ? 1 : 0);
+    fprintf(f, "disableDTStinger=%d\n", g_disableDTStinger ? 1 : 0);
+    fprintf(f, "forceLucifer=%d\n", g_forceLucifer ? 1 : 0);
+    fprintf(f, "noHelmBreaker=%d\n", g_noHelmBreaker ? 1 : 0);
+    fprintf(f, "noHelmSplit=%d\n", g_noHelmSplit ? 1 : 0);
+    fprintf(f, "scEnable=%d\n", g_scEnableDante ? 1 : 0);
+    fprintf(f, "scCancels=%u\n", g_scCancels);
     fprintf(f, "infLightningKick=%d\n", g_infLightningKick ? 1 : 0);
     fprintf(f, "infTrickTp=%d\n", g_infTrickTp ? 1 : 0);
     fprintf(f, "infAirCalibur=%d\n", g_infAirCalibur ? 1 : 0);
@@ -4361,6 +4940,11 @@ static bool saveConfig(const char* profile) {
     fprintf(f, "chargeRateVal=%.4f\n", g_crRate);
     fprintf(f, "ladyJC=%d\n",        g_ljWant ? 1 : 0);
     fprintf(f, "heightBypass=%d\n",  g_hrWant ? 1 : 0);
+    fprintf(f, "easyStep=%d\n", g_easyStepWant ? 1 : 0);
+    fprintf(f, "skipShotgun=%d\n", g_skipShotgun);
+    fprintf(f, "skipPandora=%d\n", g_skipPandora);
+    fprintf(f, "skipGilgamesh=%d\n", g_skipGilgamesh);
+    fprintf(f, "skipLucifer=%d\n", g_skipLucifer);
     fprintf(f, "themeBlue=%d\n",     g_blue ? 1 : 0);
     fprintf(f, "zh=%d\n",            g_zh ? 1 : 0);
     fprintf(f, "showFps=%d\n",       g_showFps ? 1 : 0);
@@ -4388,14 +4972,19 @@ static bool loadConfig(const char* profile) {
     uint32_t hudLockVtbl = g_hudLockVtbl; bool hideHp = g_hudHpOn;
     bool  dof = g_noDOF, mb = g_noMotionBlur, gr = g_noGodRays;
     bool  camOn = g_camOn, speedOn = g_speedOn, luc = g_lucOn, fh = g_fhOn;
+    bool  snatch = g_snatchOn, rosePins = g_rosePins != 0;
     bool  forceFocus = g_forceFocus, borderless = g_borderless, pauseOnOpen = g_pauseOnOpen;
     bool  skipBoot = g_skipBoot;
     bool  jc = g_jcOn; float jcMult = g_jcMult; bool dtSpam = g_dtSpam; bool airTrick = g_atOn; bool swordTrick = g_swOn;
     bool  vergilJDC = g_vergilJDC;
     bool  infBeowulf = g_infBeowulf;
     bool  infGilgamesh = g_infGilgamesh, infLightningKick = g_infLightningKick;
+    bool  disableDTStinger = g_disableDTStinger, forceLuc = (g_forceLucifer != 0);
+    bool  noHelmBreaker = g_noHelmBreaker, noHelmSplit = g_noHelmSplit;
+    bool  scEnable = g_scEnableDante; unsigned scCancels = g_scCancels;
     bool  infTrickTp = g_infTrickTp, infAirCalibur = g_infAirCalibur;
     bool  crWant = g_crWant; float crRate = g_crRate; bool ljWant = g_ljWant, hrWant = g_hrWant;
+    bool  easyStep = g_easyStepWant;
     bool  themeBlue = g_blue, zh = g_zh, showFps = g_showFps;
     float guiScale = g_uiScale; bool guiAutoDPI = g_uiAutoDPI;
     float musicVol = g_musicVol, camDist = g_camDist, camHeight = g_camHeight;
@@ -4426,15 +5015,30 @@ static bool loadConfig(const char* profile) {
         else if (!strcmp(key, "godrays"))  gr       = atoi(val) != 0;
         else if (!strcmp(key, "camOn"))    camOn    = atoi(val) != 0;
         else if (!strcmp(key, "camDist"))  camDist  = (float)atof(val);
+        else if (!strcmp(key, "camVarsOn")) g_camVarsOn = atoi(val) != 0;
+        else if (!strcmp(key, "cvHeight"))   g_cvHeight   = (float)atof(val);
+        else if (!strcmp(key, "cvDistance")) g_cvDistance = (float)atof(val);
+        else if (!strcmp(key, "cvDistLock")) g_cvDistLock = (float)atof(val);
+        else if (!strcmp(key, "cvAngle"))    g_cvAngle    = (float)atof(val);
+        else if (!strcmp(key, "cvFov"))      g_cvFov      = (float)atof(val);
+        else if (!strcmp(key, "cvFovBattle")) g_cvFovBattle = (float)atof(val);
         else if (!strcmp(key, "camHeight"))camHeight= (float)atof(val);
         else if (!strcmp(key, "speedOn"))  speedOn  = atoi(val) != 0;
         else if (!strcmp(key, "luc"))      luc      = atoi(val) != 0;
+        else if (!strcmp(key, "snatch"))   snatch   = atoi(val) != 0;
+        else if (!strcmp(key, "rosePins")) rosePins = atoi(val) != 0;
         else if (!strcmp(key, "fh"))       fh       = atoi(val) != 0;
         else if (!strcmp(key, "jc"))       jc       = atoi(val) != 0;
         else if (!strcmp(key, "dtSpam"))   dtSpam   = atoi(val) != 0;
         else if (!strcmp(key, "vergilJDC")) vergilJDC = atoi(val) != 0;
         else if (!strcmp(key, "infBeowulf")) infBeowulf = atoi(val) != 0;
         else if (!strcmp(key, "infGilgamesh")) infGilgamesh = atoi(val) != 0;
+        else if (!strcmp(key, "disableDTStinger")) disableDTStinger = atoi(val) != 0;
+        else if (!strcmp(key, "forceLucifer")) forceLuc = atoi(val) != 0;
+        else if (!strcmp(key, "noHelmBreaker")) noHelmBreaker = atoi(val) != 0;
+        else if (!strcmp(key, "noHelmSplit")) noHelmSplit = atoi(val) != 0;
+        else if (!strcmp(key, "scEnable")) scEnable = atoi(val) != 0;
+        else if (!strcmp(key, "scCancels")) scCancels = (unsigned)strtoul(val, nullptr, 10);
         else if (!strcmp(key, "infLightningKick")) infLightningKick = atoi(val) != 0;
         else if (!strcmp(key, "infTrickTp")) infTrickTp = atoi(val) != 0;
         else if (!strcmp(key, "infAirCalibur")) infAirCalibur = atoi(val) != 0;
@@ -4445,6 +5049,11 @@ static bool loadConfig(const char* profile) {
         else if (!strcmp(key, "chargeRateVal")) crRate = (float)atof(val);
         else if (!strcmp(key, "ladyJC"))        ljWant = atoi(val) != 0;
         else if (!strcmp(key, "heightBypass"))  hrWant = atoi(val) != 0;
+        else if (!strcmp(key, "easyStep"))      easyStep = atoi(val) != 0;
+        else if (!strcmp(key, "skipShotgun"))   g_skipShotgun   = atoi(val) ? 1 : 0;
+        else if (!strcmp(key, "skipPandora"))   g_skipPandora   = atoi(val) ? 1 : 0;
+        else if (!strcmp(key, "skipGilgamesh")) g_skipGilgamesh = atoi(val) ? 1 : 0;
+        else if (!strcmp(key, "skipLucifer"))   g_skipLucifer   = atoi(val) ? 1 : 0;
         else if (!strcmp(key, "themeBlue"))     themeBlue = atoi(val) != 0;
         else if (!strcmp(key, "zh"))            zh     = atoi(val) != 0;
         else if (!strcmp(key, "showFps"))       showFps = atoi(val) != 0;
@@ -4492,12 +5101,19 @@ static bool loadConfig(const char* profile) {
 
     // --- Lucifer / Full House restores ---
     if (luc && !g_lucOn) applyLuciferBug(); else if (!luc && g_lucOn) stopLuciferBug();
+    if (snatch && !g_snatchOn) applySnatchRange(); else if (!snatch && g_snatchOn) stopSnatchRange();
+    g_rosePins = rosePins ? 1 : 0;
     if (fh  && !g_fhOn)  applyFullHouseFix(); else if (!fh && g_fhOn) stopFullHouseFix();
     g_dtSpam = dtSpam;
     g_vergilJDC = vergilJDC;
     g_infBeowulf = infBeowulf;
     g_infGilgamesh = infGilgamesh; g_infLightningKick = infLightningKick;
     g_infTrickTp = infTrickTp; g_infAirCalibur = infAirCalibur;
+    g_disableDTStinger = disableDTStinger;
+    g_forceLucifer = forceLuc ? 1 : 0;
+    if (forceLuc && !g_flOn) applyForceLucifer(); else if (!forceLuc && g_flOn) stopForceLucifer();
+    g_noHelmBreaker = noHelmBreaker; g_noHelmSplit = noHelmSplit;
+    g_scEnableDante = scEnable; g_scCancels = scCancels;
 
     // --- options: theme / language / fps / GUI scale (persist the GUI choices too) ---
     g_zh = zh; g_showFps = showFps;
@@ -4510,6 +5126,8 @@ static bool loadConfig(const char* profile) {
     //     the caves only while playing the matching character. ---
     g_crRate = crRate;
     g_crWant = crWant; g_ljWant = ljWant; g_hrWant = hrWant;
+    g_easyStepWant = easyStep;
+    skipSyncGun(); skipSyncSword();
 
     g_jcMult = jcMult;
     if (jc && !g_jcOn) applyJumpCancel(); else if (!jc && g_jcOn) stopJumpCancel();
@@ -4676,7 +5294,7 @@ static void applyTheme(bool blue) {
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowBorderSize = 1.0f;
     s.FrameBorderSize  = 1.0f;            // accent outlines around controls
-    // Compact, DMC4Hook-style density: smaller text + tight spacing so everything
+    // Compact, density: smaller text + tight spacing so everything
     // fits on one screen. The font scale is owned by applyUiScale() now (so the GUI
     // scale slider can drive it); these are the BASE (unscaled) size values.
     s.WindowPadding    = ImVec2(6, 3);
@@ -5019,10 +5637,18 @@ static void disableEverythingToggles() {
     stopCombatPatch(g_pFastTrick); stopCombatPatch(g_pKnockback); stopCombatPatch(g_pMovingTarget);
     stopCombatPatch(g_pTrickRange); stopCombatPatch(g_pEnemyAIMax); stopCombatPatch(g_pFreeSwords);
     stopCombatPatch(g_pInfTableHop); stopCombatPatch(g_pSuperTableHop);
+    stopSnatchRange();
     g_superCancel = false;
+    g_easyQuickDrive = false;
+    g_scEnableDante = false; g_scCancels = 0;
+    if (g_mutRunning) { g_mutRunning = false; mutatorStop(); }
     for (int i = 0; i < 4; i++) setTaunt(i, 0);                 // remove taunt caves
     g_fpsLimit = 0;
     g_crWant = g_ljWant = g_hrWant = false;                     // live toggles (removed next frame)
+    g_easyStepWant = false; if (g_esOn) stopEasyStep();
+    g_skipShotgun = g_skipPandora = g_skipGilgamesh = g_skipLucifer = 0; skipSyncGun(); skipSyncSword();
+    g_disableDTStinger = false;
+    g_noHelmBreaker = g_noHelmSplit = false; if (g_helmHookOn) stopHelmHook();
     g_infTrickTp = g_infAirCalibur = g_dtSpam = g_vergilJDC = false;
     g_infBeowulf = g_infGilgamesh = g_infLightningKick = false;
     g_diagOn = false;
@@ -5038,7 +5664,7 @@ static void DrawUI() {
     drawFpsOverlay();      // corner FPS counter shows even with the menu hidden
     comboReadoutTick();    // live combo move-name readout (also shows menu-closed)
     if (!g_show) return;
-    // Compact, DMC4Hook-style window: small default size pinned to the top-left,
+    // Compact, window: small default size pinned to the top-left,
     // freely resizable afterwards. Sized to fit on one screen.
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     // Default size follows the GUI scale so the window is proportioned for the
@@ -5170,6 +5796,24 @@ static void DrawUI() {
     // --- Camera & Window ---
     if (ImGui::CollapsingHeader("Camera & Window", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Indent(8.0f);
+
+        // MistressDMC: Custom Camera Variables (additive; 0 = vanilla). [untested in-game]
+        ImGui::Checkbox("Custom Camera Variables", &g_camVarsOn);
+        hint("Additive camera tweaks (0 = vanilla). Height/Distance/FOV verified; Angle & FOV-in-battle inferred. [experimental]");
+        if (g_camVarsOn) {
+            ImGui::Indent(8.0f); ImGui::PushItemWidth(160.0f);
+            ImGui::InputFloat("Height",            &g_cvHeight,    10.0f, 20.0f,  "%.0f");
+            ImGui::InputFloat("Distance",          &g_cvDistance,  100.0f, 200.0f, "%.0f");
+            ImGui::InputFloat("Distance (Lockon)", &g_cvDistLock,  100.0f, 200.0f, "%.0f");
+            ImGui::InputFloat("Angle",             &g_cvAngle,     0.1f,  0.2f,   "%.2f");
+            ImGui::InputFloat("FOV",               &g_cvFov,       10.0f, 20.0f,  "%.0f");
+            ImGui::InputFloat("FOV (In Battle)",   &g_cvFovBattle, 10.0f, 20.0f,  "%.0f");
+            ImGui::PopItemWidth();
+            if (ImGui::Button("Reset Camera Variables"))
+                g_cvHeight=g_cvDistance=g_cvDistLock=g_cvAngle=g_cvAngleLock=g_cvFov=g_cvFovBattle=0.0f;
+            ImGui::Unindent(8.0f);
+        }
+        ImGui::Separator();
 
         // Camera tool (reapplied each frame, like Slow-Mo). Distance = the
         // COD-style zoom-out; FOV just widens the lens.
@@ -5579,10 +6223,15 @@ static void DrawUI() {
             combatPatchToggle(g_pKnockback);    hint("Always release on knockback.");
             combatPatchToggle(g_pInfTableHop);  hint("Nero: removes the once-per-window limit on Table Hopper (the Devil Bringer evade) -- hop as often as you like.");
             combatPatchToggle(g_pSuperTableHop);hint("Nero: changes the Table Hopper count/variant (mov ecx,3 -> 0) for the 'super' behaviour.");
+            { bool sr = g_snatchOn;
+              if (ImGui::Checkbox("Increased Snatch Range", &sr)) { if (sr) applySnatchRange(); else stopSnatchRange(); }
+              hint("Nero: triples Snatch / Devil Bringer reach (snatch-length forced to 2550.0f = 3x Lv3). Load a level before toggling. [experimental]"); }
             combatPatchToggle(g_pEnemyAIMax);   hint("Enemies fight at maximum aggression -- no passive/idle backoff. Flips the AI gate at 0x564C68 (jb->ja). Ported from the Non-JP cheat table.");
             combatPatchToggle(g_pFreeSwords);    hint("Vergil: Summoned Swords / Spiral / Storm / Blistering / Heavy Rain cost no Devil Trigger -- summon them freely. (NOPs the DT-debit at 0x4D004B.)");
             ImGui::Checkbox("Super Cancel (everything cancellable)", &g_superCancel);
             hint("Keeps every move cancellable -- any move's recovery/stiffness can be cancelled straight into the next action, so you can chain moves with no recovery (advanced combo tech). Pins the 8 cancel-table slots to 2.");
+            ImGui::Checkbox("Easy Quick Drive", &g_easyQuickDrive);
+            hint("Dante: Prop is cancellable into Quick Drive during its first frames (~frame 7). [experimental]");
 
             ImGui::Spacing();
             bool dm = g_dmgOn;
@@ -5757,12 +6406,26 @@ static void DrawUI() {
             }
             ImGui::TextDisabled("Reverts Dante's Lucifer to the original 2008 DMC4 feel");
             ImGui::TextDisabled("(needle cap 128 -> 16, whole rose set detonates at once).");
+            { bool rp = g_rosePins != 0;
+              if (ImGui::Checkbox("Rose Removes Pins", &rp)) g_rosePins = rp ? 1 : 0;
+              hint("Rose despawns pins instead of detonating them. [experimental]"); }
+            { bool fl = (g_forceLucifer != 0);
+              if (ImGui::Checkbox("Force Lucifer", &fl)) { g_forceLucifer = fl ? 1 : 0; if (fl) applyForceLucifer(); }
+              hint("Lucifer's rose stays loaded across weapon changes (never force-despawned). Load a level first. [experimental]"); }
             bool fh = g_fhOn;
             if (ImGui::Checkbox("Fix Full House", &fh)) {
                 if (fh) applyFullHouseFix(); else stopFullHouseFix();
             }
             ImGui::TextDisabled("Restores vanilla Full House inertia behaviour DMC4SE broke.");
             ImGui::TextDisabled("Both take effect immediately; load a level first.");
+            ImGui::Separator();
+            ImGui::TextDisabled("Skip weapons while cycling (Dante): [experimental]");
+            { bool ss=g_skipShotgun, sp=g_skipPandora, sg=g_skipGilgamesh, sl=g_skipLucifer;
+              if (ImGui::Checkbox("Skip Shotgun", &ss))   { g_skipShotgun=ss?1:0;   if(ss) g_skipPandora=0;   skipSyncGun(); }
+              if (ImGui::Checkbox("Skip Pandora", &sp))   { g_skipPandora=sp?1:0;   if(sp) g_skipShotgun=0;   skipSyncGun(); }
+              if (ImGui::Checkbox("Skip Gilgamesh", &sg)) { g_skipGilgamesh=sg?1:0; if(sg) g_skipLucifer=0;   skipSyncSword(); }
+              if (ImGui::Checkbox("Skip Lucifer", &sl))   { g_skipLucifer=sl?1:0;   if(sl) g_skipGilgamesh=0; skipSyncSword(); }
+              ImGui::TextDisabled("Shotgun<->Pandora and Gilgamesh<->Lucifer are mutually exclusive."); }
             ImGui::Unindent(8.0f);
         }
         if (ImGui::CollapsingHeader("Boot / Opening Movie", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -5812,6 +6475,12 @@ static void DrawUI() {
     }
 
     // ===================== Section 6: Mods (skins + BP) =====================
+    if (beginBlackTab("Mutators###s7")) {
+        ImGui::BeginChild("t7", ImVec2(0, -footerH));
+        mutatorDrawTab();
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
     if (beginBlackTab("Mods###s6")) {
         ImGui::BeginChild("t6", ImVec2(0, -footerH));
         ImGui::TextDisabled("Put each mod in its own folder inside the MODS folder next to");
@@ -6156,9 +6825,17 @@ static HRESULT __stdcall hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
         initModule();
         populateCaves();   // core caves first
         populateCheats();  // then patches (spawn matrix sorts to bottom in UI)
+        // Auto Royal Guard (block any hit) -- RE'd on the 2023 downgrade build.
+        //  +4DD6CA: CanRoyalBlock() predicate: jne fail (75 50) -> jmp success (EB 4C)
+        //  +4DD740: Royal Block timing-window gate: jb fail (72 02) -> nop nop (90 90)
+        // Together: every incoming attack is treated as a valid Royal Block.
+        addPatch("Royal Guard","Auto Royal Guard (block any hit)",
+                 {{0x4DD6CA,{0xEB,0x4C},{0x75,0x50}},
+                  {0x4DD740,{0x90,0x90},{0x72,0x02}}});
         g_skipBoot = bootSkipInstalled();  // reflect any stub already installed on disk
         applyTeleportCrashFix();   // guard the game's null-deref so area jumps can't crash
         applyTeleportCrashFix2();  // second null-deref site (refcount acquire on null stage obj)
+        installRoseRemovesPins();   // MistressDMC: cave gated by g_rosePins flag (installed once)
         applyEmProbe();            // log every spawned actor's category + vtable (enemy-class hunt)
         verifyAvailability();
         // --- one-shot self-test: can an in-process code write even land in memory? ---
@@ -6190,6 +6867,7 @@ static HRESULT __stdcall hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
     if (g_imguiInit && effectiveUiScale() != g_uiScaleApplied) applyUiScale();
     updateMenuMusic();   // start/stop the looping menu track on open/close
     updateCamera();      // reapply the FOV target each frame while enabled
+    applyCamVars();      // MistressDMC: additive custom camera deltas
     updateMajinPins();   // infinite-trickster-teleport / air-calibur upkeep
     bootSkipTick();      // auto-confirm the boot warning screens
     diagTick();          // DEBUG move-state logger (toggle in DEBUG tab) -> overlay.log
@@ -6225,6 +6903,7 @@ static HRESULT __stdcall hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
         }
     }
     ImGui::NewFrame();
+    mutatorTick();   // MistressDMC: drive Random Mutator Mode (needs valid DeltaTime/DisplaySize)
     DrawUI();
     ImGui::EndFrame();
     ImGui::Render();

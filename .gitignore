@@ -17,3 +17,6 @@ MODS/*
 
 # release zips are uploaded as release assets, not committed
 *.zip
+
+# internal RE notes -- not for public repo
+docs/
