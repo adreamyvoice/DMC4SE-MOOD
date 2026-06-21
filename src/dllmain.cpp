@@ -694,8 +694,12 @@ static bool g_doppKeyCapture = false; // when armed, the next key pressed become
 static void* activePlayer() {
     if (!g_base) return nullptr;
     char* mgr = *(char**)(g_base + RVA_PLAYERMGR);
-    if (!mgr) return nullptr;
-    return *(void**)(mgr + 0x24);
+    // mgr (and the actor it points to) can be a stale/garbage non-null pointer at
+    // the title screen / between levels (seen as 0xff0000xx) -- a bare null check
+    // isn't enough; deref'ing mgr+0x24 on junk page-faults. Validate readability.
+    if (!mgr || !memReadable(mgr, 0x28)) return nullptr;
+    void* a = *(void**)(mgr + 0x24);
+    return (a && memReadable(a, 0x50)) ? a : nullptr;
 }
 static int doppIdentify(void* actor) {
     if (!actor) return -1;
@@ -838,6 +842,27 @@ static void* g_emProbeCave = nullptr;
 static bool  g_emProbeOn   = false;
 static volatile uint32_t g_realDante  = 0;   // game-spawned Dante (hittable, has sword)
 static volatile uint32_t g_ghostDante = 0;   // the one we spawn (set in emSpawnNow)
+// Read a spawned actor's resource id ("emNNN") by scanning its header for a
+// pointer to an em-name string inside the module. The 2019 build is DRM-encrypted
+// on disk, so factories can't be named statically -- this lets the trainer
+// self-identify what each factory actually builds, live. Returns "" if none found.
+static const char* emIdOfActor(void* actor) {
+    static char out[8];
+    if (!actor || !memReadable(actor, 0x600)) return "";
+    char* a = (char*)actor;
+    for (int off = 0; off < 0x600; off += 4) {
+        uintptr_t p = *(uintptr_t*)(a + off);
+        if (!inModule(p, 6) || !memReadable((void*)p, 6)) continue;
+        const unsigned char* s = (const unsigned char*)p;
+        if (s[0] == 'e' && s[1] == 'm' && s[2] >= '0' && s[2] <= '9'
+            && s[3] >= '0' && s[3] <= '9' && s[4] >= '0' && s[4] <= '9' && s[5] == 0) {
+            out[0]='e'; out[1]='m'; out[2]=s[2]; out[3]=s[3]; out[4]=s[4]; out[5]=0;
+            return out;
+        }
+    }
+    return "";
+}
+
 extern "C" __attribute__((cdecl)) void emProbeLogger() {
     void* a = (void*)g_probeActor;
     if (!a || (uintptr_t)a < 0x10000) return;
@@ -853,7 +878,15 @@ extern "C" __attribute__((cdecl)) void emProbeLogger() {
     }
     static uint32_t seen[96]; static int n = 0;
     for (int i = 0; i < n; i++) if (seen[i] == vtRVA) return; // dedupe
-    if (n < 96) { seen[n++] = vtRVA; logf("[emprobe] cat=0x%X actor=%p vtableRVA=0x%X", g_probeCat, a, vtRVA); }
+    if (n < 96) {
+        seen[n++] = vtRVA;
+        const char* eid = emIdOfActor(a);
+        uint32_t ret = g_probeRet;
+        bool game = (ret >= (uint32_t)g_base && ret < (uint32_t)(g_base + g_modSize));
+        logf("[emprobe] cat=0x%X %s vtableRVA=0x%X spawnerRVA=0x%X actor=%p",
+             g_probeCat, eid[0] ? eid : "(?)", vtRVA,
+             game ? (ret - (uint32_t)g_base) : ret, a);
+    }
 }
 static void applyEmProbe() {
     if (g_emProbeOn || !g_base) return;
@@ -896,25 +929,39 @@ static void applyEmProbe() {
 // Enemy spawner. Each enemy has a no-arg factory (RVA below) that allocates and
 // constructs the actor; we call it, place it in front of the player, and register
 // it into the scene as an enemy (category 0xF).
-struct EmType { const char* name; uint32_t createRVA; };
+struct EmType { const char* name; uint32_t createRVA; uint32_t arcRVA; };
+// emID->name from flemia's Multi_Trainer (the build's REAL ids, not standard DMC4);
+// createRVA = the no-arg factory, enumerated from the readable 2015 exe (= 2019 code
+// + DRM wrapper, same layout -- verified vs the user's in-game spawns). arcRVA =
+// the "rom\enemy\emNNN" package string; emSpawnNow mounts it before the factory so
+// the enemy's model/AI is resident even on a floor that never uses it (Bloody
+// Palace, wrong story room) -- without it the actor spawns with no model and never
+// appears. Each factory's ctor writes its emID to actor+0x1920 (how the pairing was
+// confirmed). NOTE: heavy bosses (Bael em019, Echidna em021, Angelo Credo em022,
+// Angelo Agnus em023) are NOT here -- bare create-factory crashes them.
+// Full roster -- valid on the 2015 build (the one the game is downgraded to).
+// emID->name from flemia's Multi_Trainer; createRVA = the no-arg factory (starts
+// with `push imm32`, validated at spawn time). Heavy bosses (Bael/Echidna/Credo/
+// Agnus) are excluded -- bare create-factory crashes them on any build.
 static const EmType kEmTypes[] = {
-    { "Scarecrow Arm (em000)", 0x24CE40 },
-    { "Scarecrow (em001)",     0x26E590 },
-    { "Frost (em003)",         0x26F6F0 },
-    { "Bianco Angelo (em005)", 0x2718A0 },
-    { "Alto Angelo (em006)",   0x287560 },
-    { "Chimera (em008)",       0x290130 },
-    { "Cutlass (em010)",       0x2B6D60 },
-    { "Blitz (em011)",         0x2C80E0 },
-    { "Chimera Seed (em013)",  0x2F2C60 },
-    { "Dagon (em017)",         0x334D50 },
-    { "Berial (em018)",        0x34E9C0 },
-    { "Angelo Credo (em020)",  0x3A0A50 },
-    { "Sanctus Statue Injured (em025)", 0x3FEBA0 },
-    { "Sanctus Statue Idle (em026)",    0x4184A0 },
-    { "Sanctus (em029)",       0x41F490 },
-    { "Sanctus 2 (em030)",     0x429480 },
-    { "Kyrie (em036)",         0x44C330 },
+    { "Scarecrow (Leg)",   0x24CE40, 0xC21154 },  // em000
+    { "Scarecrow (Arm)",   0x26E590, 0xC21144 },  // em001
+    { "Mega Scarecrow",    0x26F6F0, 0xC21134 },  // em003
+    { "Bianco Angelo",     0x2718A0, 0xC21124 },  // em005
+    { "Alto Angelo",       0x287560, 0xC21114 },  // em006 (custom altoCreate path)
+    { "Mephisto",          0x290130, 0xC21104 },  // em008
+    { "Faust",             0x2A8080, 0xC210F4 },  // em009
+    { "Frost",             0x2B6D60, 0xC210E4 },  // em010
+    { "Assault",           0x2C80E0, 0xC210D4 },  // em011
+    { "Blitz",             0x2E7600, 0xC210C4 },  // em012
+    { "Chimera Seed",      0x2F2C60, 0xC210B4 },  // em013
+    { "Cutlass",           0x30B370, 0xC210A4 },  // em015
+    { "Gladius",           0x3244F0, 0xC21094 },  // em016
+    { "Basilisk",          0x334D50, 0xC21084 },  // em017
+    { "Berial",            0x34E9C0, 0xC21074 },  // em018
+    { "Sanctus",           0x41F490, 0xC20FE0 },  // em029
+    { "Sanctus Diabolica", 0x429480, 0xC20FD0 },  // em030
+    { "Kyrie",             0x44C330, 0xC20F80 },  // em036
 };
 static const int kNEmTypes = (int)(sizeof(kEmTypes) / sizeof(kEmTypes[0]));
 static int g_emSel = 0;
@@ -1075,14 +1122,32 @@ static void preloadPl006() {
 }
 
 static void danteApplyStats(char* e);   // defined below; stamps real Dante's stats onto a ghost
+
 static void emSpawnNow(uint32_t createRVA) {
-    void* active = activePlayer();
+    void* active = activePlayer();   // null-safe (returns null if no live player) -- placement
+                                     // below tolerates null, exactly as the working 1.2 build did
     typedef void* (__cdecl *CreateFn)();
+    // Safety: every real enemy factory starts with `push imm32` (0x68) -- the
+    // getSingleton prologue. If the byte at the address isn't that, this build's
+    // layout differs from the one these RVAs were taken from (the 2019 DRM build
+    // moved everything), so calling it would run the WRONG code and crash. Bail
+    // safely instead. (altoCreate path is exempt -- it doesn't call by RVA.)
+    if (createRVA != 0x287560) {
+        uint8_t* fp = (uint8_t*)(g_base + createRVA);
+        if (!memReadable(fp, 5) || fp[0] != 0x68) {
+            logf("[em] factory 0x%X invalid on this build (0x%02X) -- spawn unavailable",
+                 createRVA, memReadable(fp, 1) ? fp[0] : 0xFF);
+            return;
+        }
+    }
     void* enemy = (createRVA == 0x287560) ? altoCreate()         // em006 custom factory
                                           : ((CreateFn)(g_base + createRVA))();
     if (!enemy || (uintptr_t)enemy < 0x10000) { logf("[em] create rva 0x%X returned null", createRVA); return; }
     char* e = (char*)enemy;
     logf("[em] created %p vtableRVA=0x%X", enemy, (unsigned)(*(uintptr_t*)e - g_base));
+    { const char* eid = emIdOfActor(enemy);
+      logf("[emid] factory 0x%X -> %s vtableRVA=0x%X", createRVA,
+           eid[0] ? eid : "(unknown)", (unsigned)(*(uintptr_t*)e - g_base)); }
     // Drop it in front of the player, not beside. The actor's transform sits at
     // +0x10; forward is row 2 (+0x30/34/38), position row 3 (+0x40). Walk along
     // forward so it lands ahead whichever way you're facing. Enemy position also
@@ -3280,7 +3345,14 @@ static void disableSpeedCave() {
 // every write is validated so it no-ops if no save is loaded.
 static const uint32_t kSaveBaseOff = 0xF59F10;
 static const int      kProudMax    = 9000000;
-static bool savePtr(uintptr_t& p) { return readPtr(g_base + kSaveBaseOff, p) && p; }
+// The resolved save block must also be READABLE, not just non-null: at the title
+// screen / during a level transition the slot can hold a stale, freed, or garbage
+// pointer. Without this check the per-frame modCostumeTick() (and the unlock
+// buttons) deref p+off on junk and page-fault. 0x800 covers every field we touch
+// (largest is Lady proud-souls 0x578 + the costume fields).
+static bool savePtr(uintptr_t& p) {
+    return readPtr(g_base + kSaveBaseOff, p) && p && memReadable((void*)p, 0x800);
+}
 static void uB(uintptr_t p, uint32_t off) { uint8_t v = 1; writeMem(p + off, &v, 1); }
 static void uBv(uintptr_t p, uint32_t off, uint8_t v) { writeMem(p + off, &v, 1); }
 static void uI(uintptr_t p, uint32_t off, int v) { writeMem(p + off, &v, 4); }
@@ -3663,6 +3735,11 @@ static volatile LONG        g_presentGuard = 0;   // 1 while one present drives 
 // present stretches game + overlay together and the UI stays aligned + clickable.
 static UINT g_bbW = 0, g_bbH = 0;
 static void CreateRTV(IDXGISwapChain* sc) {
+    // hkResizeBuffers can fire during startup/resolution setup BEFORE the first
+    // Present has resolved the device (common on the DXMT backend), so g_device is
+    // still null -- deref'ing it here page-faults. No-op until the device exists;
+    // the first hkPresent init calls CreateRTV again once g_device is set.
+    if (!g_device) return;
     ID3D10Texture2D* bb = nullptr;
     if (SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D10Texture2D), (void**)&bb)) && bb) {
         g_device->CreateRenderTargetView(bb, nullptr, &g_rtv);
@@ -6040,7 +6117,23 @@ static void DrawUI() {
         }
         if (ImGui::CollapsingHeader("Enemy Spawn", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Indent(8.0f);
-            ImGui::TextDisabled("Pick an enemy and click Spawn (works in any mission).");
+            // Swapper: turns Scarecrow spawns into the picked enemy via the game's
+            // own spawn code (most reliable -- the game loads the enemy itself).
+            ImGui::TextDisabled("Swapper: Scarecrow spawns become the picked enemy.");
+            ImGui::SetNextItemWidth(200);
+            if (ImGui::BeginCombo("Spawn as##swap", kSpawnPick[g_spawnPickSel])) {
+                for (int i = 0; i < kNSpawnPick; i++) {
+                    bool s = (i == g_spawnPickSel);
+                    if (ImGui::Selectable(kSpawnPick[i], s)) applySpawnPick(i);
+                    if (s) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Off##swap")) applySpawnPick(0);
+            ImGui::Separator();
+            // Direct spawn: calls the enemy's factory and drops it in front of you.
+            ImGui::TextDisabled("Direct spawn (pick + Spawn, in active gameplay):");
             ImGui::SetNextItemWidth(200);
             if (ImGui::BeginCombo("Enemy##em", kEmTypes[g_emSel].name)) {
                 for (int i = 0; i < kNEmTypes; i++) {

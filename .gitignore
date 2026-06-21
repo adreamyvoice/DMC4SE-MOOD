@@ -20,3 +20,7 @@ MODS/*
 
 # internal RE notes -- not for public repo
 docs/
+
+# downgrade patcher binaries -- shipped as a release asset, not committed
+downgrade/*.xdelta
+downgrade/xdelta3.exe

@@ -1,0 +1,45 @@
+DMC4SE-MOOD  --  Downgrade to the 2015 launch build
+===================================================
+
+WHY
+DMC4SE-MOOD (and most DMC4SE trainers/mods) are built for the ORIGINAL 2015
+launch build of Devil May Cry 4: Special Edition. The current Steam build (2019)
+moved everything around internally, so cheats grey out and the enemy spawner
+won't work on it. This patcher converts your installed game from the 2019 build
+back to 2015. It only ships the *difference* between the two builds -- you must
+already own the game.
+
+WHAT YOU NEED
+- DMC4SE installed and updated to the current Steam build (2019).
+- The files in this folder.
+
+HOW TO USE  (Windows, or Mac/Linux via CrossOver/Wine)
+1. Copy EVERYTHING in this folder into your game folder:
+     ...\steamapps\common\Special Edition\
+   (the folder that has DevilMayCry4SpecialEdition.exe)
+2. Run  "Downgrade to 2015.bat".
+   - CrossOver: run it inside the same bottle as the game, or use the
+     "Downgrade to 2015.command" below.
+3. It backs up your current build to  backup_2019\  then patches the game.
+4. Launch the game. The trainer's cheats and spawner now work.
+
+HOW TO USE  (macOS, native -- needs xdelta3:  brew install xdelta3)
+   Copy these files into the Special Edition folder, then run
+   "Downgrade to 2015.command" (double-click). Same backup/restore behaviour.
+
+UNDO
+- Run  "Restore 2019.bat"  (or "Restore 2019.command"), OR
+- In Steam: Verify integrity of game files.
+
+IMPORTANT
+After downgrading, do NOT use Steam's "Verify integrity of game files" during
+normal play -- it re-downloads the 2019 build and undoes the patch.
+
+VERIFY (optional)
+Hashes after a correct downgrade:
+  DevilMayCry4SpecialEdition.exe   MD5  f53b82b332b6b28d79e3e6b600b9507d
+  steam_api.dll                    MD5  69bee18efe39e0bd24b8ac979b560f39
+Source (2019) build the patch expects:
+  DevilMayCry4SpecialEdition.exe   MD5  751b7f82509eee56b20bd42a49cd5515
+
+xdelta3.exe is the standard open-source xdelta tool (https://github.com/jmacd/xdelta).
