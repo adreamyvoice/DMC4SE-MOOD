@@ -1,0 +1,26 @@
+# build output (intermediate objects only; the release dinput8.dll IS tracked)
+build/
+*.o
+*.obj
+
+# editor / OS
+.DS_Store
+.vscode/
+.idea/
+compile_commands.json
+
+# user mod content -- never commit mod archives (can be many GB).
+# only the MODS README + the combo move-name list are tracked.
+MODS/*
+!MODS/README.md
+!MODS/movenames.cfg
+
+# release zips are uploaded as release assets, not committed
+*.zip
+
+# internal RE notes -- not for public repo
+docs/
+
+# downgrade patcher binaries -- shipped as a release asset, not committed
+downgrade/*.xdelta
+downgrade/xdelta3.exe
