@@ -25,6 +25,9 @@ Join the community: **discord.gg/aethergrid**
 
 ## Features
 
+- **NEW in 1.4 — local 2-player co-op.** A second player takes over the
+  doppelganger with their own controller or keyboard, playing the same
+  character alongside you. See the **Co-op** tab.
 - **372 cheats** across God Mode, Devil Trigger, Summoned Swords, Mobility,
   Cutscenes, Bloody Palace, and the full enemy **spawn-swap matrix**.
 - Highlights: No One Takes Damage, No One Dies, **Enemy 1-Hit Kill**, **Must
@@ -91,6 +94,37 @@ There are **two** ways to mod, for different things — neither overwrites your 
   animations — use the MODS folder for those.
 
 See `MODS/README.md` for the full layout.
+
+### Co-op
+
+Local **2-player co-op** — the doppelganger becomes a real second player
+instead of mirroring your inputs, so both of you play the same character
+together.
+
+- **Enable co-op** — off by default; with it off the doppelganger behaves
+  exactly as it always has. Summon the doppelganger to start.
+- **Player 1 / Player 2 device** — assign each player independently: game
+  default, Controller 1–4, keyboard (WASD set), keyboard (Arrows/Numpad set),
+  or either keyboard set plus mouse. Player 2 defaults to **Auto**: the first
+  spare controller — never the one Player 1 is using — otherwise a keyboard
+  set. So one controller gives you controller + keyboard automatically, and a
+  second controller is picked up as soon as it is plugged in.
+- **Co-op camera** — zooms out as the players separate so both stay in frame.
+- **Auto-revive P2** — revives Player 2 about five seconds after going down.
+- **Keep a keyboard player's keys off the other player** — stops shared
+  keyboard keys from driving both characters.
+- **Warp P2 to P1** — button, or the `HOME` key.
+
+Player 2 keyboard layouts:
+
+    WASD set : WASD move, Space jump, J/K/L attacks, LShift lock-on,
+               Q = L2, E = R1, R = L1
+    Arrow set: Arrows move, Num0 jump, Num1/2/3 attacks, RShift lock-on,
+               Num4 = L2, Num5 = R1, Num6 = L1
+
+Two people can share one keyboard using the two different sets, and two
+physical keyboards work the same way (Windows reports them as a single
+device, so the key sets are what separate the players).
 
 ### Language / Theme
 English / Simplified Chinese, and a red ⇄ blue accent theme.

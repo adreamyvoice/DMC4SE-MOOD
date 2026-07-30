@@ -4634,6 +4634,8 @@ static void diagTick() {
 // (actor+0x4C4 list node). Left for a real-Windows session where CE breakpoints work.
 // ===== MistressDMC: Random Mutator Mode (timed weighted-random gameplay mutators) =====
 static void hint(const char* tip);   // fwd (defined with the GUI helpers below)
+
+#include "coop.h"   // MistressDMC: local 2-player co-op (1.4)
 static bool setRoomSpeed(float v) {
     uintptr_t base; if (!readPtr(g_base + 0xF59F18, base) || !base) return false;
     return writeMem(base + 0x34, &v, 4);
@@ -6680,6 +6682,12 @@ static void DrawUI() {
         ImGui::EndChild();
         ImGui::EndTabItem();
     }
+    if (beginBlackTab("Co-op###s8")) {
+        ImGui::BeginChild("t8", ImVec2(0, -footerH));
+        coopDrawTab();
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
     if (beginBlackTab("Mods###s6")) {
         ImGui::BeginChild("t6", ImVec2(0, -footerH));
         ImGui::TextDisabled("Put each mod in its own folder inside the MODS folder next to");
@@ -7219,6 +7227,7 @@ static HRESULT __stdcall hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
     }
     ImGui::NewFrame();
     mutatorTick();   // MistressDMC: drive Random Mutator Mode (needs valid DeltaTime/DisplaySize)
+    coopFrame();     // MistressDMC: drive co-op (P2 input routing, camera, revive)
     DrawUI();
     ImGui::EndFrame();
     ImGui::Render();
